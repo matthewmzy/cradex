@@ -1,0 +1,44 @@
+# CRA Method Configuration
+# ========================
+# Cascaded Residual Adaptation: axis-decomposed multi-stage training.
+
+cra:
+  # Stage 0 — base policy (fixed/narrow DR)
+  base_num_iterations: 5000
+  base_num_steps: 16
+
+  # Stage 1..N — adaptation stages
+  stage_num_iterations: 3000
+  stage_num_steps: 16
+
+  # Order of DR axes to enable (one per stage)
+  # Recommended: order by single-axis reward-drop (largest first)
+  axis_order:
+    - "gravity_dir"     # Stage 1: gravity direction
+    - "gravity_mag"     # Stage 2: gravity magnitude
+    - "object_mass"     # Stage 3: object mass
+    - "friction"        # Stage 4: friction coefficient
+
+  # Adaptation encoder architecture
+  encoder_type: "gru"        # "gru" or "conv1d"
+  encoder_hidden: 128
+  encoder_latent: 16         # z_i dimension per stage
+  encoder_layers: 2
+  window_size: 50            # history window (steps)
+
+  # Residual head
+  residual_hidden: [256, 128]
+  residual_init_scale: 0.01  # small init for smooth transition
+
+# PPO tuning for CRA stages
+ppo:
+  lr: 3.0e-4
+  clip_ratio: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.01         # small entropy for exploration
+  max_grad_norm: 1.0
+  num_epochs: 5
+  mini_batch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr_schedule: "linear"

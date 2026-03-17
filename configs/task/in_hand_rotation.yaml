@@ -1,0 +1,35 @@
+# In-Hand Rotation Task Configuration
+# ====================================
+
+# Environment
+num_envs: 4096
+episode_length: 200
+headless: true
+device: "cuda:0"
+
+# Object
+object_type: "cube"        # cube | sphere | cylinder | ycb
+object_asset_file: ""      # path for ycb/custom mesh
+
+# Task rewards
+success_tolerance: 0.1     # radians — angle for success
+rotation_reward_scale: 1.0
+fall_dist: 0.3             # meters — drop threshold
+fall_penalty: -50.0
+action_penalty_scale: 0.02
+
+# Hand
+kp_scale: 1.0
+kd_scale: 1.0
+
+# PPO defaults for this task
+ppo:
+  lr: 3.0e-4
+  clip_ratio: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.0
+  max_grad_norm: 1.0
+  num_epochs: 5
+  mini_batch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95
