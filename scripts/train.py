@@ -163,6 +163,9 @@ def main():
             dr_axes=cfg.get("dr_axes", [
                 "gravity", "object_mass", "friction"
             ]),
+            # Network architecture from config (for large baselines)
+            actor_hidden_dims=cfg.get("actor_hidden_dims"),
+            critic_hidden_dims=cfg.get("critic_hidden_dims"),
         )
         if args.method == "rma":
             baseline_cfg.rma_latent_dim = cfg.get("rma_latent_dim", 32)
