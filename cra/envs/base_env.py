@@ -83,6 +83,17 @@ class DexterousEnvBase(abc.ABC):
         self._prepare_sim()
         self._allocate_buffers()
 
+        # Create viewer for non-headless mode
+        self.viewer = None
+        if not cfg.headless:
+            self.viewer = self.gym.create_viewer(self.sim, gymapi.CameraProperties())
+            if self.viewer is None:
+                print("Warning: failed to create viewer, running headless")
+            else:
+                cam_pos = gymapi.Vec3(1.0, 1.0, 1.5)
+                cam_target = gymapi.Vec3(0.0, 0.0, 0.6)
+                self.gym.viewer_camera_look_at(self.viewer, None, cam_pos, cam_target)
+
     # ------------------------------------------------------------------
     # Simulation setup
     # ------------------------------------------------------------------
@@ -171,6 +182,12 @@ class DexterousEnvBase(abc.ABC):
         """Reset specific environment instances."""
         ...
 
+    def _apply_external_forces(self) -> None:
+        """Apply per-env external forces (default: no-op).
+
+        Subclasses that need per-env gravity variation override this.
+        """
+
     # ------------------------------------------------------------------
     # Standard gym-like interface
     # ------------------------------------------------------------------
@@ -198,6 +215,9 @@ class DexterousEnvBase(abc.ABC):
         # Apply actions to actuators
         self._apply_actions(actions)
 
+        # Apply per-env external forces (e.g. pseudo-gravity workaround)
+        self._apply_external_forces()
+
         # Step simulation
         for _ in range(self.cfg.control_freq_inv):
             self.gym.simulate(self.sim)
@@ -207,6 +227,12 @@ class DexterousEnvBase(abc.ABC):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
+
+        # Render if viewer exists
+        if self.viewer is not None:
+            self.gym.step_graphics(self.sim)
+            self.gym.draw_viewer(self.viewer, self.sim, True)
+            self.gym.sync_frame_time(self.sim)
 
         self.progress_buf += 1
 
@@ -229,5 +255,7 @@ class DexterousEnvBase(abc.ABC):
         return self.obs_buf, self.rew_buf, done, self.extras
 
     def close(self) -> None:
+        if hasattr(self, "viewer") and self.viewer is not None:
+            self.gym.destroy_viewer(self.viewer)
         if hasattr(self, "gym") and hasattr(self, "sim"):
             self.gym.destroy_sim(self.sim)

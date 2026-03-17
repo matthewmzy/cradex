@@ -1,0 +1,32 @@
+# RMA Large Baseline
+# ==================
+# Larger RMA policy for fair parameter-count comparison with CRA.
+
+num_iterations: 10000
+num_steps: 16
+
+dr_axes:
+  - "gravity"
+  - "object_mass"
+  - "friction"
+
+# Wider hidden layers and larger latent to match CRA param count
+rma_latent_dim: 64
+rma_encoder_hidden: 512
+rma_window_size: 50
+actor_hidden_dims: [1024, 512, 256]
+critic_hidden_dims: [1024, 512, 256]
+
+normalize_obs: true
+obs_clip_range: 5.0
+
+ppo:
+  lr: 3.0e-4
+  clip_ratio: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 1.0
+  num_epochs: 5
+  mini_batch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95

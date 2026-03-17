@@ -40,6 +40,7 @@ class ActorCritic(nn.Module):
     Actor:  obs -> MLP -> action_mean
             log_std is a learnable parameter vector (state-independent).
     Critic: obs -> MLP -> scalar value
+            (or [obs, privileged] -> MLP when privileged_dim > 0)
     """
 
     def __init__(
@@ -51,6 +52,7 @@ class ActorCritic(nn.Module):
         activation: type[nn.Module] = nn.ELU,
         init_noise_std: float = 1.0,
         fixed_std: bool = False,
+        privileged_dim: int = 0,
     ) -> None:
         super().__init__()
         if actor_hidden_dims is None:
@@ -60,6 +62,7 @@ class ActorCritic(nn.Module):
 
         self.obs_dim = obs_dim
         self.action_dim = action_dim
+        self.privileged_dim = privileged_dim
 
         # Actor network: obs -> action mean
         self.actor = _build_mlp(obs_dim, action_dim, actor_hidden_dims, activation)
@@ -70,8 +73,9 @@ class ActorCritic(nn.Module):
         )
         self.fixed_std = fixed_std
 
-        # Critic network: obs -> value
-        self.critic = _build_mlp(obs_dim, 1, critic_hidden_dims, activation)
+        # Critic network: obs (+ privileged) -> value
+        critic_input_dim = obs_dim + privileged_dim
+        self.critic = _build_mlp(critic_input_dim, 1, critic_hidden_dims, activation)
 
         # Weight initialization
         self._init_weights()
@@ -87,7 +91,11 @@ class ActorCritic(nn.Module):
         nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
         nn.init.orthogonal_(self.critic[-1].weight, gain=1.0)
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        obs: torch.Tensor,
+        privileged: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Full forward pass.
 
         Returns
@@ -98,7 +106,8 @@ class ActorCritic(nn.Module):
         """
         action_mean = self.actor(obs)
         action_std = self.log_std.exp().expand_as(action_mean)
-        value = self.critic(obs)
+        critic_input = obs if privileged is None else torch.cat([obs, privileged], dim=-1)
+        value = self.critic(critic_input)
         return action_mean, action_std, value
 
     def get_action_mean(self, obs: torch.Tensor) -> torch.Tensor:
@@ -106,7 +115,10 @@ class ActorCritic(nn.Module):
         return self.actor(obs)
 
     def get_action(
-        self, obs: torch.Tensor, deterministic: bool = False
+        self,
+        obs: torch.Tensor,
+        deterministic: bool = False,
+        privileged: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample an action and return (action, log_prob, value).
 
@@ -114,6 +126,7 @@ class ActorCritic(nn.Module):
         ----------
         obs : (batch, obs_dim)
         deterministic : if True, return the mean action.
+        privileged : optional (batch, privileged_dim) for asymmetric critic.
 
         Returns
         -------
@@ -121,7 +134,7 @@ class ActorCritic(nn.Module):
         log_prob : (batch,)
         value    : (batch, 1)
         """
-        action_mean, action_std, value = self.forward(obs)
+        action_mean, action_std, value = self.forward(obs, privileged)
         dist = Normal(action_mean, action_std)
         if deterministic:
             action = action_mean
@@ -131,7 +144,10 @@ class ActorCritic(nn.Module):
         return action, log_prob, value
 
     def evaluate_actions(
-        self, obs: torch.Tensor, actions: torch.Tensor
+        self,
+        obs: torch.Tensor,
+        actions: torch.Tensor,
+        privileged: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Evaluate given actions under current policy.
 
@@ -143,7 +159,7 @@ class ActorCritic(nn.Module):
         entropy  : (batch,)
         value    : (batch, 1)
         """
-        action_mean, action_std, value = self.forward(obs)
+        action_mean, action_std, value = self.forward(obs, privileged)
         dist = Normal(action_mean, action_std)
         log_prob = dist.log_prob(actions).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)

@@ -13,11 +13,12 @@ cra:
 
   # Order of DR axes to enable (one per stage)
   # Recommended: order by single-axis reward-drop (largest first)
+  # "gravity" is the unified axis (direction+magnitude); the legacy
+  # split into gravity_dir / gravity_mag is no longer recommended.
   axis_order:
-    - "gravity_dir"     # Stage 1: gravity direction
-    - "gravity_mag"     # Stage 2: gravity magnitude
-    - "object_mass"     # Stage 3: object mass
-    - "friction"        # Stage 4: friction coefficient
+    - "gravity"         # Stage 1: 3-D gravity vector (dir+mag merged)
+    - "object_mass"     # Stage 2: object mass
+    - "friction"        # Stage 3: friction coefficient
 
   # Adaptation encoder architecture
   encoder_type: "gru"        # "gru" or "conv1d"

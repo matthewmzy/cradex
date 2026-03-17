@@ -85,7 +85,7 @@ def build_ppo_config(cfg: dict) -> PPOConfig:
 def main():
     parser = argparse.ArgumentParser(description="CRA Dexterous Manipulation Training")
     parser.add_argument("--method", type=str, default="cra",
-                        choices=["cra", "full_dr", "rma"],
+                        choices=["cra", "full_dr", "rma", "curriculum_dr"],
                         help="Training method")
     parser.add_argument("--config", type=str, default="",
                         help="Path to YAML config file")
@@ -95,6 +95,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument("--headless", action="store_true", default=True)
+    parser.add_argument("--render", action="store_true", default=False,
+                        help="Enable rendering (overrides --headless)")
     parser.add_argument("--experiment-name", type=str, default="")
     parser.add_argument("--output-dir", type=str, default="outputs")
     parser.add_argument("--resume", type=str, default="",
@@ -110,7 +112,7 @@ def main():
     cfg["seed"] = args.seed
     cfg["device"] = args.device
     cfg["num_envs"] = args.num_envs
-    cfg["headless"] = args.headless
+    cfg["headless"] = args.headless and not args.render
 
     exp_name = args.experiment_name or f"{args.method}_{args.seed}"
 
@@ -137,7 +139,7 @@ def main():
             stage_num_iterations=cra_cfg.get("stage_num_iterations", 3000),
             stage_num_steps=cra_cfg.get("stage_num_steps", 16),
             axis_order=cra_cfg.get("axis_order", [
-                "gravity_dir", "gravity_mag", "object_mass", "friction"
+                "gravity", "object_mass", "friction"
             ]),
             stage_encoder_type=cra_cfg.get("encoder_type", "gru"),
             stage_encoder_hidden=cra_cfg.get("encoder_hidden", 128),
@@ -159,13 +161,23 @@ def main():
             ppo=ppo_cfg,
             device=args.device,
             dr_axes=cfg.get("dr_axes", [
-                "gravity_dir", "gravity_mag", "object_mass", "friction"
+                "gravity", "object_mass", "friction"
             ]),
         )
         if args.method == "rma":
             baseline_cfg.rma_latent_dim = cfg.get("rma_latent_dim", 32)
             baseline_cfg.rma_encoder_hidden = cfg.get("rma_encoder_hidden", 256)
             baseline_cfg.rma_window_size = cfg.get("rma_window_size", 50)
+        elif args.method == "curriculum_dr":
+            baseline_cfg.curriculum_axis_order = cfg.get(
+                "curriculum_axis_order", ["gravity", "object_mass", "friction"]
+            )
+            baseline_cfg.curriculum_base_iterations = cfg.get(
+                "curriculum_base_iterations", 5000
+            )
+            baseline_cfg.curriculum_stage_iterations = cfg.get(
+                "curriculum_stage_iterations", 3000
+            )
         trainer = BaselineTrainer(baseline_cfg, env, eval_env)
 
     # Train

@@ -28,6 +28,7 @@ from cra.envs.base_env import DexterousEnvBase
 from cra.models.cra_policy import CRAPolicy, CRAStageConfig
 from cra.utils.logger import Logger
 from cra.utils.checkpoint import save_checkpoint, load_checkpoint
+from cra.utils.obs_normalizer import ObsNormalizer
 
 
 @dataclass
@@ -48,8 +49,7 @@ class CRATrainerConfig:
 
     # Axes to train (in order)
     axis_order: list[str] = field(default_factory=lambda: [
-        "gravity_dir",
-        "gravity_mag",
+        "gravity",
         "object_mass",
         "friction",
     ])
@@ -75,6 +75,10 @@ class CRATrainerConfig:
 
     # Resume
     resume_path: str = ""
+
+    # Observation normalization
+    normalize_obs: bool = True
+    obs_clip_range: float = 5.0
 
 
 class CRATrainer:
@@ -109,6 +113,14 @@ class CRATrainer:
             action_low=-1.0,
             action_high=1.0,
         ).to(self.device)
+
+        # Observation normalizer
+        self.obs_normalizer: ObsNormalizer | None = None
+        if cfg.normalize_obs:
+            self.obs_normalizer = ObsNormalizer(
+                obs_dim=env.cfg.obs_dim,
+                clip_range=cfg.obs_clip_range,
+            ).to(self.device)
 
         # PPO
         self.ppo = PPO(cfg.ppo, self.device)
@@ -151,6 +163,7 @@ class CRATrainer:
             self.policy,
             os.path.join(self.run_dir, "checkpoints", "stage_0_base.pt"),
             stage=0,
+            extra=self._normalizer_state(),
         )
 
         # ============================================================
@@ -218,6 +231,7 @@ class CRATrainer:
                     f"stage_{stage_idx + 1}_{axis_name}.pt",
                 ),
                 stage=stage_idx + 1,
+                extra=self._normalizer_state(),
             )
 
         self.logger.log_text("CRA training complete!")
@@ -245,6 +259,9 @@ class CRATrainer:
         )
 
         obs = self.env.reset()
+        if self.obs_normalizer is not None:
+            self.obs_normalizer.train()
+            obs = self.obs_normalizer(obs)
         if use_history and self.history_buf is not None:
             self.history_buf.reset(torch.arange(self.env.num_envs, device=self.device))
 
@@ -266,6 +283,8 @@ class CRATrainer:
                         action, log_prob, value = self.policy.get_action(obs)
 
                 next_obs, reward, done, extras = self.env.step(action)
+                if self.obs_normalizer is not None:
+                    next_obs = self.obs_normalizer(next_obs)
 
                 # Store transition
                 if use_history and self.history_buf is not None:
@@ -411,3 +430,9 @@ class CRATrainer:
             "eval_success_rate": total_success / max(episodes_done, 1),
             "eval_episodes": episodes_done,
         }
+
+    def _normalizer_state(self) -> dict | None:
+        """Return obs normalizer state dict for checkpointing."""
+        if self.obs_normalizer is not None:
+            return {"obs_normalizer": self.obs_normalizer.state_dict()}
+        return None

@@ -1,0 +1,31 @@
+# Curriculum DR Baseline
+# ======================
+# Same staged DR schedule as CRA, but a single unfrozen network.
+# Isolates whether CRA's gains come from the curriculum or the cascade.
+
+method: "curriculum_dr"
+num_steps: 16
+
+# Curriculum schedule (matching CRA exactly)
+curriculum_axis_order:
+  - "gravity"
+  - "object_mass"
+  - "friction"
+curriculum_base_iterations: 5000
+curriculum_stage_iterations: 3000
+
+# Observation normalization
+normalize_obs: true
+obs_clip_range: 5.0
+
+ppo:
+  lr: 3.0e-4
+  clip_ratio: 0.2
+  value_loss_coef: 0.5
+  entropy_coef: 0.01
+  max_grad_norm: 1.0
+  num_epochs: 5
+  mini_batch_size: 4096
+  gamma: 0.99
+  gae_lambda: 0.95
+  lr_schedule: "linear"

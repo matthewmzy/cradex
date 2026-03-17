@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cra.envs.shadow_hand_rotation import ShadowHandRotation, RotationEnvConfig
 from cra.models.cra_policy import CRAPolicy, CRAStageConfig
-from cra.models.baselines import FullDRPolicy, RMAPolicy
+from cra.models.baselines import FullDRPolicy, CurriculumDRPolicy, RMAPolicy
 from cra.algo.rollout_buffer import HistoryBuffer
 from cra.utils.checkpoint import load_checkpoint
 
@@ -33,7 +33,7 @@ def evaluate_cra(
 ) -> dict[str, float]:
     """Load and evaluate a CRA policy."""
     if axis_order is None:
-        axis_order = ["gravity_dir", "gravity_mag", "object_mass", "friction"]
+        axis_order = ["gravity", "object_mass", "friction"]
 
     dev = torch.device(device)
 
@@ -117,8 +117,9 @@ def evaluate_baseline(
     """Load and evaluate a baseline policy."""
     dev = torch.device(device)
 
-    if method == "full_dr":
-        policy = FullDRPolicy(
+    if method == "full_dr" or method == "curriculum_dr":
+        policy_cls = CurriculumDRPolicy if method == "curriculum_dr" else FullDRPolicy
+        policy = policy_cls(
             obs_dim=env.cfg.obs_dim,
             action_dim=env.cfg.action_dim,
         ).to(dev)
@@ -134,7 +135,7 @@ def evaluate_baseline(
     policy.eval()
 
     # Enable all DR
-    for ax in ["gravity_dir", "gravity_mag", "object_mass", "friction"]:
+    for ax in ["gravity", "object_mass", "friction"]:
         env.dr_manager.enable_axis(ax)
 
     use_hist = method == "rma"
@@ -195,7 +196,7 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate trained policy")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--method", type=str, default="cra",
-                        choices=["cra", "full_dr", "rma"])
+                        choices=["cra", "full_dr", "rma", "curriculum_dr"])
     parser.add_argument("--num-episodes", type=int, default=200)
     parser.add_argument("--num-envs", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda:0")

@@ -7,8 +7,9 @@ one at a time as new adaptation stages are added.
 
 Supported axes
 --------------
-- gravity_dir   : direction of gravity (sampled on unit sphere)
-- gravity_mag   : magnitude of gravity (default 9.81 m/s^2)
+- gravity       : unified 3D gravity vector (recommended)
+- gravity_dir   : (legacy) direction of gravity (sampled on unit sphere)
+- gravity_mag   : (legacy) magnitude of gravity (default 9.81 m/s^2)
 - object_mass   : mass of the manipulated object
 - friction       : contact friction coefficient
 - object_scale  : uniform scaling of object geometry
@@ -48,14 +49,31 @@ class DRAxisConfig:
 # ======================================================================
 
 def default_axes() -> dict[str, DRAxisConfig]:
-    """Return a dictionary of standard DR axes with sensible defaults."""
+    """Return a dictionary of standard DR axes with sensible defaults.
+
+    The unified ``gravity`` axis is recommended over the legacy
+    ``gravity_dir`` / ``gravity_mag`` split.  It samples a 3-D gravity
+    vector whose magnitude ranges between 7 and 12  m/s² and whose
+    direction covers the full sphere.
+    """
     return {
+        # --- Unified gravity axis (recommended) ---
+        "gravity": DRAxisConfig(
+            name="gravity",
+            enabled=False,
+            low=[-1.0, -1.0, -1.0],
+            high=[1.0, 1.0, 1.0],
+            nominal=[0.0, 0.0, -1.0],
+            dim=3,
+            # Sampling handled specially: direction on sphere × magnitude
+        ),
+        # --- Legacy split axes (backward compatibility) ---
         "gravity_dir": DRAxisConfig(
             name="gravity_dir",
             enabled=False,
             low=[-1.0, -1.0, -1.0],
             high=[1.0, 1.0, 1.0],
-            nominal=[0.0, 0.0, -1.0],  # standard downward gravity
+            nominal=[0.0, 0.0, -1.0],
             dim=3,
         ),
         "gravity_mag": DRAxisConfig(
@@ -198,6 +216,14 @@ class AxisDRManager:
 
     def _sample_axis(self, cfg: DRAxisConfig, n: int) -> torch.Tensor:
         """Sample uniformly (or log-uniformly) within the axis range."""
+        # Unified gravity axis: sample direction on sphere × magnitude
+        if cfg.name == "gravity":
+            direction = torch.randn(n, 3, device=self.device)
+            direction = torch.nn.functional.normalize(direction, dim=-1)
+            mag_low, mag_high = 7.0, 12.0
+            magnitude = mag_low + torch.rand(n, 1, device=self.device) * (mag_high - mag_low)
+            return direction * magnitude  # (N, 3) gravity vector
+
         low = torch.tensor(cfg.low, device=self.device, dtype=torch.float32)
         high = torch.tensor(cfg.high, device=self.device, dtype=torch.float32)
 
@@ -214,7 +240,7 @@ class AxisDRManager:
             u = torch.rand(n, cfg.dim, device=self.device)
             val = low + u * (high - low)
 
-        # Special handling for gravity direction: normalize to unit sphere
+        # Legacy gravity direction: normalize to unit sphere
         if cfg.name == "gravity_dir":
             val = torch.nn.functional.normalize(val, dim=-1)
 
@@ -228,12 +254,18 @@ class AxisDRManager:
         return nom.unsqueeze(0).expand(n, -1).clone()
 
     def get_gravity_vectors(self, params: dict[str, torch.Tensor]) -> torch.Tensor:
-        """Combine gravity_dir and gravity_mag into 3-D gravity vectors.
+        """Return 3-D gravity vectors from sampled params.
+
+        Supports both the unified ``gravity`` axis and the legacy
+        ``gravity_dir`` + ``gravity_mag`` split.
 
         Returns
         -------
         gravity : (N, 3)
         """
+        if "gravity" in params and self.axes["gravity"].enabled:
+            return params["gravity"]
+        # Legacy path
         direction = params["gravity_dir"]   # (N, 3), unit vectors
         magnitude = params["gravity_mag"]   # (N, 1)
         return direction * magnitude

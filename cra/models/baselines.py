@@ -1,9 +1,11 @@
 """Baseline policies for comparison with CRA.
 
-- FullDRPolicy : same architecture as the base ActorCritic, trained with
-                 full domain randomization from scratch.
-- RMAPolicy    : Rapid Motor Adaptation style — single adaptation encoder
-                 that identifies ALL environment parameters at once.
+- FullDRPolicy      : same architecture as the base ActorCritic, trained with
+                      full domain randomization from scratch.
+- CurriculumDRPolicy: same architecture as FullDRPolicy, but trained with the
+                      same staged DR curriculum as CRA (no frozen cascade).
+- RMAPolicy         : Rapid Motor Adaptation style — single adaptation encoder
+                      that identifies ALL environment parameters at once.
 """
 
 from __future__ import annotations
@@ -26,6 +28,27 @@ class FullDRPolicy(ActorCritic):
     Architecturally identical to the CRA base policy; difference is
     purely in the training regime (all DR axes randomized from step 1).
     This class exists mainly for clarity in experiment configs.
+    """
+    pass
+
+
+# ======================================================================
+# CurriculumDRPolicy — same architecture, staged DR curriculum
+# ======================================================================
+
+class CurriculumDRPolicy(ActorCritic):
+    """Actor-Critic trained with the same staged DR curriculum as CRA.
+
+    Architecturally identical to FullDRPolicy / ActorCritic.  The difference
+    is purely in the training regime: DR axes are enabled one at a time in
+    the same order as CRA, but the *entire* network continues training with
+    all parameters unfrozen (no cascade, no frozen stages).
+
+    This baseline isolates whether CRA's gains come from:
+      (a) the axis-decomposed curriculum schedule, or
+      (b) the modular frozen-cascade architecture.
+    If CurriculumDR matches CRA → the architecture is not necessary.
+    If CurriculumDR << CRA   → the frozen cascade is the key ingredient.
     """
     pass
 
@@ -136,10 +159,8 @@ class RMAPolicy(nn.Module):
         obs_history: torch.Tensor,
         action_history: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean, action_std, _ = self.forward(obs, obs_history, action_history)
+        action_mean, action_std, value = self.forward(obs, obs_history, action_history)
         dist = Normal(action_mean, action_std)
         log_prob = dist.log_prob(actions).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        z = self.encoder(obs_history, action_history)
-        value = self.critic(torch.cat([obs, z], dim=-1))
         return log_prob, entropy, value

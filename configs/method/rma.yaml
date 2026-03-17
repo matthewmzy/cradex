@@ -5,10 +5,9 @@
 num_iterations: 10000
 num_steps: 16
 
-# All DR axes enabled simultaneously
+# All DR axes enabled simultaneously (unified gravity axis)
 dr_axes:
-  - "gravity_dir"
-  - "gravity_mag"
+  - "gravity"
   - "object_mass"
   - "friction"
 

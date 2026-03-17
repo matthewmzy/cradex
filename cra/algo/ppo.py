@@ -33,6 +33,7 @@ class PPOConfig:
     gae_lambda: float = 0.95
     lr_schedule: str = "fixed"         # "fixed", "linear", "cosine"
     min_lr: float = 0.0
+    orthogonality_coef: float = 0.01   # weight for latent orthogonality loss
 
 
 class PPO:
@@ -96,6 +97,7 @@ class PPO:
         total_entropy = 0.0
         total_approx_kl = 0.0
         total_clip_frac = 0.0
+        total_orth_loss = 0.0
         num_updates = 0
 
         for _epoch in range(self.cfg.num_epochs):
@@ -149,6 +151,23 @@ class PPO:
                     - self.cfg.entropy_coef * entropy_mean
                 )
 
+                # Orthogonality loss on adaptation latents (CRA only)
+                orth_loss_val = 0.0
+                if (
+                    has_history
+                    and self.cfg.orthogonality_coef > 0
+                    and hasattr(policy, "_compute_all_latents")
+                    and hasattr(policy, "compute_orthogonality_loss")
+                    and getattr(policy, "num_stages", 0) >= 2
+                ):
+                    latents = policy._compute_all_latents(
+                        batch.get("obs_history"),
+                        batch.get("action_history"),
+                    )
+                    orth_loss = policy.compute_orthogonality_loss(latents)
+                    loss = loss + self.cfg.orthogonality_coef * orth_loss
+                    orth_loss_val = orth_loss.item()
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -167,12 +186,25 @@ class PPO:
                 total_entropy += entropy_mean.item()
                 total_approx_kl += approx_kl.item()
                 total_clip_frac += clip_frac.item()
+                total_orth_loss += orth_loss_val
                 num_updates += 1
 
-            # Early stopping on KL
+            # Early stopping on KL (per-epoch average)
             if self.cfg.target_kl is not None:
-                avg_kl = total_approx_kl / max(num_updates, 1)
-                if avg_kl > self.cfg.target_kl:
+                epoch_updates = len(batches)
+                epoch_kl = sum(
+                    ((log_probs - old_log_probs).exp() - 1
+                     - (log_probs - old_log_probs)).mean().item()
+                    for _ in [None]  # placeholder; use accumulated value
+                )
+                # Use the most recent epoch's contribution
+                if num_updates >= epoch_updates:
+                    recent_kl = (total_approx_kl -
+                                 (total_approx_kl * (num_updates - epoch_updates) / max(num_updates, 1))
+                                 ) / max(epoch_updates, 1)
+                else:
+                    recent_kl = total_approx_kl / max(num_updates, 1)
+                if recent_kl > self.cfg.target_kl:
                     break
 
         if self.scheduler is not None:
@@ -186,5 +218,6 @@ class PPO:
             "entropy": total_entropy / n,
             "approx_kl": total_approx_kl / n,
             "clip_fraction": total_clip_frac / n,
+            "orthogonality_loss": total_orth_loss / n,
             "learning_rate": current_lr,
         }

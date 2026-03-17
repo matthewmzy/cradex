@@ -5,6 +5,22 @@ from __future__ import annotations
 import torch
 
 
+# ======================================================================
+# Quaternion convention helpers
+# ======================================================================
+# IsaacGym uses (x, y, z, w) convention in root_state tensors.
+# Our quaternion math uses (w, x, y, z) convention.
+
+def xyzw_to_wxyz(q: torch.Tensor) -> torch.Tensor:
+    """Convert IsaacGym (x,y,z,w) quaternion to (w,x,y,z) convention."""
+    return torch.cat([q[..., 3:4], q[..., 0:3]], dim=-1)
+
+
+def wxyz_to_xyzw(q: torch.Tensor) -> torch.Tensor:
+    """Convert (w,x,y,z) quaternion to IsaacGym (x,y,z,w) convention."""
+    return torch.cat([q[..., 1:4], q[..., 0:1]], dim=-1)
+
+
 def quat_mul(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
     """Multiply two quaternions (w, x, y, z convention)."""
     w1, x1, y1, z1 = q1.unbind(dim=-1)
@@ -41,6 +57,7 @@ def rotation_reward(
     target_quat: torch.Tensor,
     rot_eps: float = 0.1,
     rot_reward_scale: float = 1.0,
+    success_bonus: float = 250.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute reward for in-hand rotation task.
 
@@ -50,6 +67,7 @@ def rotation_reward(
     target_quat : (N, 4) target orientation
     rot_eps     : threshold (rad) for success bonus
     rot_reward_scale : scaling factor
+    success_bonus : reward added on each success
 
     Returns
     -------
@@ -63,7 +81,7 @@ def rotation_reward(
 
     # Success bonus
     success = (angle_diff < rot_eps).float()
-    reward = reward + success * 2.0
+    reward = reward + success * success_bonus
 
     return reward, success
 

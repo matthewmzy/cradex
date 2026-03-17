@@ -51,9 +51,10 @@ class HistoryBuffer:
         obs    : (num_envs, obs_dim)
         action : (num_envs, action_dim)
         """
-        # Shift left by one position
-        self.obs_history[:, :-1] = self.obs_history[:, 1:].clone()
-        self.action_history[:, :-1] = self.action_history[:, 1:].clone()
+        # Shift left by one position (no clone needed — non-overlapping
+        # copy direction is safe in PyTorch)
+        self.obs_history[:, :-1] = self.obs_history[:, 1:]
+        self.action_history[:, :-1] = self.action_history[:, 1:]
         # Insert newest at the right end
         self.obs_history[:, -1] = obs
         self.action_history[:, -1] = action
@@ -71,8 +72,13 @@ class HistoryBuffer:
         self.action_history[env_ids] = 0.0
 
     def get(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return current (obs_history, action_history) snapshots."""
-        return self.obs_history.clone(), self.action_history.clone()
+        """Return current (obs_history, action_history) snapshots.
+
+        Returns references to the internal tensors.  Callers that need
+        to store the result across time steps (e.g. RolloutBuffer) must
+        clone explicitly.
+        """
+        return self.obs_history, self.action_history
 
 
 class RolloutBuffer:

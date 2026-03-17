@@ -7,8 +7,7 @@ num_steps: 16
 
 # All DR axes enabled simultaneously
 dr_axes:
-  - "gravity_dir"
-  - "gravity_mag"
+  - "gravity"
   - "object_mass"
   - "friction"
 

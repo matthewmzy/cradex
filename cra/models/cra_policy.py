@@ -16,7 +16,6 @@ At inference all residuals are computed in parallel (additive structure):
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass, field
 
 import torch
@@ -92,6 +91,7 @@ class CRAPolicy(nn.Module):
         action_dim: int,
         action_low: float = -1.0,
         action_high: float = 1.0,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.obs_dim = obs_dim
@@ -232,24 +232,38 @@ class CRAPolicy(nn.Module):
             total_residual = total_residual + residual_head(obs, z)
         return total_residual
 
+    def forward_with_latents(
+        self,
+        obs: torch.Tensor,
+        obs_history: torch.Tensor | None = None,
+        action_history: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
+        """Compute composite action mean and return latents.
+
+        Returns
+        -------
+        action_mean : (B, action_dim)
+        latents     : list of (B, latent_dim_i) or None if no history
+        """
+        base_action = self.base_policy.get_action_mean(obs)
+        if obs_history is None or len(self.stages) == 0:
+            return base_action, None
+
+        latents = self._compute_all_latents(obs_history, action_history)
+        residual = self._compute_all_residuals(obs, latents)
+        action = base_action + residual
+
+        return torch.clamp(action, self.action_low, self.action_high), latents
+
     def forward_action_mean(
         self,
         obs: torch.Tensor,
         obs_history: torch.Tensor | None = None,
         action_history: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Compute the deterministic composite action (no noise).
-
-        If no history is provided, only the base policy is used.
-        """
-        base_action = self.base_policy.get_action_mean(obs)
-        if obs_history is None or len(self.stages) == 0:
-            return base_action
-
-        latents = self._compute_all_latents(obs_history, action_history)
-        residual = self._compute_all_residuals(obs, latents)
-        action = base_action + residual
-        return torch.clamp(action, self.action_low, self.action_high)
+        """Compute the deterministic composite action (no noise)."""
+        action_mean, _ = self.forward_with_latents(obs, obs_history, action_history)
+        return action_mean
 
     def get_action(
         self,
@@ -271,7 +285,8 @@ class CRAPolicy(nn.Module):
             return self.base_policy.get_action(obs, deterministic=deterministic)
 
         # --- Stage training mode ---
-        action_mean = self.forward_action_mean(obs, obs_history, action_history)
+        # Compute action mean and latents in a single pass (no redundant GRU calls)
+        action_mean, latents = self.forward_with_latents(obs, obs_history, action_history)
         std = self.log_std.exp().expand_as(action_mean)
 
         from torch.distributions import Normal
@@ -280,8 +295,7 @@ class CRAPolicy(nn.Module):
         action = torch.clamp(action, self.action_low, self.action_high)
         log_prob = dist.log_prob(action).sum(dim=-1)
 
-        # Value from the stage critic
-        latents = self._compute_all_latents(obs_history, action_history)
+        # Value from the stage critic (reusing latents)
         z_cat = torch.cat(latents, dim=-1)
         value = self.critic(obs, z_cat)
 
@@ -305,7 +319,8 @@ class CRAPolicy(nn.Module):
         if self._current_stage_idx == -1:
             return self.base_policy.evaluate_actions(obs, actions)
 
-        action_mean = self.forward_action_mean(obs, obs_history, action_history)
+        # Single forward pass computes both action_mean and latents
+        action_mean, latents = self.forward_with_latents(obs, obs_history, action_history)
         std = self.log_std.exp().expand_as(action_mean)
 
         from torch.distributions import Normal
@@ -313,11 +328,50 @@ class CRAPolicy(nn.Module):
         log_prob = dist.log_prob(actions).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
 
-        latents = self._compute_all_latents(obs_history, action_history)
         z_cat = torch.cat(latents, dim=-1)
         value = self.critic(obs, z_cat)
 
         return log_prob, entropy, value
+
+    # ------------------------------------------------------------------
+    # Losses
+    # ------------------------------------------------------------------
+
+    def compute_orthogonality_loss(
+        self, latents: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Compute cosine-similarity-based orthogonality loss.
+
+        Penalizes alignment between latent vectors from different stages,
+        encouraging each adapter to encode distinct information.
+
+        L_orth = sum_{i<j} cos_sim(z_i, z_j)^2
+
+        All stages should use the same latent_dim for correctness.
+
+        Parameters
+        ----------
+        latents : list of (B, latent_dim) tensors from each stage.
+
+        Returns
+        -------
+        loss : scalar tensor (0 when perfectly orthogonal).
+        """
+        if len(latents) < 2:
+            return torch.tensor(0.0, device=latents[0].device)
+
+        loss = torch.tensor(0.0, device=latents[0].device)
+        n_pairs = 0
+        for i in range(len(latents)):
+            for j in range(i + 1, len(latents)):
+                zi = latents[i]  # (B, d)
+                zj = latents[j]  # (B, d)
+                # Cosine similarity squared, averaged over batch
+                cos_sim = torch.nn.functional.cosine_similarity(zi, zj, dim=-1)
+                loss = loss + (cos_sim ** 2).mean()
+                n_pairs += 1
+
+        return loss / max(n_pairs, 1)
 
     # ------------------------------------------------------------------
     # Utilities

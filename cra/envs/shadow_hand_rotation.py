@@ -48,6 +48,7 @@ except ImportError:
 
 from cra.envs.base_env import DexterousEnvBase, EnvConfig
 from cra.envs import rewards as R
+from cra.envs.rewards import xyzw_to_wxyz
 
 
 # ======================================================================
@@ -111,9 +112,26 @@ class ShadowHandRotation(DexterousEnvBase):
         self.prev_actions = torch.zeros(
             self.num_envs, cfg.action_dim, device=self.device
         )
-        # Target orientation
+        # Target orientation — stored in IsaacGym (x,y,z,w) convention
         self.target_quat = torch.zeros(self.num_envs, 4, device=self.device)
-        self.target_quat[:, 0] = 1.0  # identity quaternion
+        self.target_quat[:, 3] = 1.0  # identity quaternion in (x,y,z,w)
+
+        # Per-env gravity vectors for external-force workaround.
+        # Gravity is a global sim param in IsaacGym, so per-env variation
+        # is implemented as an external force on the object rigid body:
+        #   F_pseudo = (g_desired - g_global) * m_object
+        self.per_env_gravity = torch.zeros(self.num_envs, 3, device=self.device)
+        self.per_env_gravity[:, 2] = -9.81  # default
+        self.per_env_object_mass = torch.full(
+            (self.num_envs,), 0.1, device=self.device
+        )
+        self._global_gravity = torch.tensor(
+            [0.0, 0.0, -9.81], device=self.device
+        )
+
+        # Force tensor for apply_rigid_body_force_tensors
+        # shape: (num_bodies_total, 3) — only object bodies get nonzero
+        self._pseudo_gravity_forces: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Environment creation
@@ -298,6 +316,31 @@ class ShadowHandRotation(DexterousEnvBase):
         # Fingertip body indices (found by name search)
         self.fingertip_indices = self._find_fingertip_indices()
 
+        # DOF indices for set_dof_state_tensor_indexed
+        # Each env has hand DOFs + object DOFs (free body = 6 DOF for root joint).
+        # The DOF layout in the global tensor is:
+        #   env0: [hand_dofs(24), object_dofs(6)], env1: [...], ...
+        dofs_per_env = self.num_hand_dofs + 6  # object has 6 DOFs (free body)
+        self.hand_dof_indices = (
+            torch.arange(self.num_envs, device=self.device) * dofs_per_env
+        ).to(torch.long)
+
+        # Object body indices (sim-global) for external force application
+        bodies_per_env = self.num_hand_bodies + self.num_object_bodies
+        self.object_body_indices = (
+            torch.arange(self.num_envs, device=self.device) * bodies_per_env
+            + self.num_hand_bodies  # object body is after hand bodies
+        ).to(torch.long)
+
+        # Allocate pseudo-gravity force tensor: (total_bodies, 3)
+        total_bodies = self.rb_state.shape[0]
+        self._pseudo_gravity_forces = torch.zeros(
+            total_bodies, 3, device=self.device
+        )
+        self._pseudo_gravity_torques = torch.zeros(
+            total_bodies, 3, device=self.device
+        )
+
     def _find_fingertip_indices(self) -> torch.Tensor:
         """Find rigid body indices for the 5 fingertips."""
         indices = []
@@ -335,21 +378,21 @@ class ShadowHandRotation(DexterousEnvBase):
         # Object position relative to hand
         obj_pos_rel = self.object_pos - self.hand_pos  # (N, 3)
 
-        # Gravity vector (from DR params or default)
-        if "gravity_dir" in self.dr_params and "gravity_mag" in self.dr_params:
-            gravity_vec = self.dr_manager.get_gravity_vectors(self.dr_params)
-        else:
-            gravity_vec = torch.zeros(self.num_envs, 3, device=self.device)
-            gravity_vec[:, 2] = -9.81
+        # Convert quaternions from IsaacGym (x,y,z,w) to our (w,x,y,z) convention
+        object_quat_wxyz = xyzw_to_wxyz(self.object_quat)  # (N, 4)
+        target_quat_wxyz = xyzw_to_wxyz(self.target_quat)  # (N, 4)
+
+        # Gravity vector (from DR params; supports both unified and legacy)
+        gravity_vec = self.per_env_gravity  # always up-to-date from _apply_dr_params
 
         self.obs_buf = torch.cat([
             self.hand_dof_pos,        # 24
             self.hand_dof_vel,        # 24
             obj_pos_rel,              # 3
-            self.object_quat,         # 4
+            object_quat_wxyz,         # 4
             self.object_linvel,       # 3
             self.object_angvel,       # 3
-            self.target_quat,         # 4
+            target_quat_wxyz,         # 4
             ft_pos_flat,              # 15
             ft_force_flat,            # 15
             self.prev_actions,        # 20
@@ -374,12 +417,17 @@ class ShadowHandRotation(DexterousEnvBase):
 
     def _compute_rewards(self) -> None:
         """Compute per-step reward and determine resets."""
+        # Convert quaternions from IsaacGym (x,y,z,w) to our (w,x,y,z) convention
+        object_quat_wxyz = xyzw_to_wxyz(self.object_quat)
+        target_quat_wxyz = xyzw_to_wxyz(self.target_quat)
+
         # Rotation reward
         rot_reward, success = R.rotation_reward(
-            self.object_quat,
-            self.target_quat,
+            object_quat_wxyz,
+            target_quat_wxyz,
             rot_eps=self.task_cfg.success_tolerance,
             rot_reward_scale=self.task_cfg.rotation_reward_scale,
+            success_bonus=self.task_cfg.reach_goal_bonus,
         )
 
         # Drop penalty
@@ -430,7 +478,7 @@ class ShadowHandRotation(DexterousEnvBase):
         self.extras["success_rate"] = success.mean().item()
         self.extras["consecutive_successes"] = self.consecutive_successes.mean().item()
         self.extras["rotation_error"] = R.quat_diff_rad(
-            self.object_quat, self.target_quat
+            object_quat_wxyz, target_quat_wxyz
         ).mean().item()
 
     # ------------------------------------------------------------------
@@ -459,6 +507,14 @@ class ShadowHandRotation(DexterousEnvBase):
         full = self.hand_dof_pos.clone()
         full[:, :SHADOW_HAND_NUM_ACTUATED] = targets_actuated
         return full.reshape(-1)
+
+    # ------------------------------------------------------------------
+    # External forces (per-env gravity workaround)
+    # ------------------------------------------------------------------
+
+    def _apply_external_forces(self) -> None:
+        """Apply pseudo-gravity forces to achieve per-env gravity."""
+        self._apply_pseudo_gravity_forces()
 
     # ------------------------------------------------------------------
     # Resets
@@ -522,7 +578,7 @@ class ShadowHandRotation(DexterousEnvBase):
         self.gym.set_dof_state_tensor_indexed(
             self.sim,
             gymtorch.unwrap_tensor(self.dof_state),
-            gymtorch.unwrap_tensor(self.hand_indices[env_ids].to(torch.int32)),
+            gymtorch.unwrap_tensor(self.hand_dof_indices[env_ids].to(torch.int32)),
             n,
         )
 
@@ -543,22 +599,23 @@ class ShadowHandRotation(DexterousEnvBase):
     def _apply_dr_params(self, env_ids: torch.Tensor) -> None:
         """Apply domain randomization parameters to the simulation.
 
-        This updates gravity, object mass, friction etc. based on
-        the current DR samples from AxisDRManager.
+        Gravity variation is implemented as per-env external forces on
+        the object (since IsaacGym gravity is a global sim param).
+        Object mass and friction are set per-actor as usual.
         """
         if not self.dr_params:
             return
 
-        # --- Gravity ---
-        if self.dr_manager.axes["gravity_dir"].enabled or self.dr_manager.axes["gravity_mag"].enabled:
+        # --- Gravity (per-env via external force workaround) ---
+        gravity_enabled = (
+            self.dr_manager.axes["gravity"].enabled
+            or self.dr_manager.axes["gravity_dir"].enabled
+            or self.dr_manager.axes["gravity_mag"].enabled
+        )
+        if gravity_enabled:
             grav_vecs = self.dr_manager.get_gravity_vectors(self.dr_params)
-            for idx in env_ids:
-                i = idx.item()
-                gx, gy, gz = grav_vecs[i].tolist()
-                sim_params = self.gym.get_sim_params(self.sim)
-                sim_params.gravity = gymapi.Vec3(gx, gy, gz)
-                self.gym.set_sim_params(self.sim, sim_params)
-                break  # IsaacGym gravity is global — use first env's value
+            self.per_env_gravity[env_ids] = grav_vecs[
+                :len(env_ids)] if len(grav_vecs) == len(env_ids) else grav_vecs[env_ids]
 
         # --- Object mass ---
         if self.dr_manager.axes["object_mass"].enabled:
@@ -572,6 +629,7 @@ class ShadowHandRotation(DexterousEnvBase):
                 self.gym.set_actor_rigid_body_properties(
                     self.envs[i], self.object_handles[i], body_props
                 )
+                self.per_env_object_mass[i] = masses[i, 0]
 
         # --- Friction ---
         if self.dr_manager.axes["friction"].enabled:
@@ -602,3 +660,27 @@ class ShadowHandRotation(DexterousEnvBase):
                 self.gym.set_actor_dof_properties(
                     self.envs[i], self.hand_handles[i], dof_props
                 )
+
+    def _apply_pseudo_gravity_forces(self) -> None:
+        """Apply per-env gravity deviation as external force on objects.
+
+        F_pseudo = (g_desired - g_global) * m_object
+        Applied every simulation step via apply_rigid_body_force_tensors.
+        """
+        if self._pseudo_gravity_forces is None:
+            return
+
+        # Compute deviation from global gravity
+        delta_g = self.per_env_gravity - self._global_gravity  # (N, 3)
+        forces = delta_g * self.per_env_object_mass.unsqueeze(-1)  # (N, 3)
+
+        # Write into the sparse force tensor
+        self._pseudo_gravity_forces.zero_()
+        self._pseudo_gravity_forces[self.object_body_indices] = forces
+
+        self.gym.apply_rigid_body_force_tensors(
+            self.sim,
+            gymtorch.unwrap_tensor(self._pseudo_gravity_forces),
+            gymtorch.unwrap_tensor(self._pseudo_gravity_torques),
+            gymapi.ENV_SPACE,
+        )

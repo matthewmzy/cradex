@@ -531,3 +531,198 @@ commit with clear description.
 ```
 
 投稿目标：**CoRL 2026** 或 **RSS 2026**（8 pages + references）
+
+---
+
+## 四、已实现的改进（Implementation Log）
+
+> **本节记录基于上述反思和 Prompt 已完成的代码改进。**
+
+### Phase 1: 核心 Bug 修复 & 架构改进
+
+#### 1. 合并 gravity 轴（A1 改进）
+- **文件**: `cra/envs/axis_dr.py`
+- 将 `gravity_dir` + `gravity_mag` 合并为统一的 `gravity` 轴
+- 采样方式: `direction = normalize(randn) × uniform(7, 12)` → 3D gravity vector
+- `get_gravity_vectors()` 支持统一和 legacy 两种路径
+- `configs/method/cra.yaml` 更新为 3 个 stage: `["gravity", "object_mass", "friction"]`
+
+#### 2. 修复 per-env 重力 DR（B1 修复）
+- **文件**: `cra/envs/shadow_hand_rotation.py`, `cra/envs/base_env.py`
+- IsaacGym 重力是全局参数，不能逐 env 设置
+- 实现外力 workaround: `F_pseudo = (g_desired - g_global) * m_object`
+- 通过 `apply_rigid_body_force_tensors()` 每 step 施加
+- `base_env.py` 添加 `_apply_external_forces()` hook
+
+#### 3. 修复 RMA 双重 encoder 调用（B2 修复）
+- **文件**: `cra/models/baselines.py`
+- `evaluate_actions()` 不再重复调用 encoder，直接复用 `forward()` 返回的 value
+
+#### 4. 移除 HistoryBuffer 多余 clone（B3 修复）
+- **文件**: `cra/algo/rollout_buffer.py`
+- 移除 `push()` 和 `get()` 中的 `.clone()`
+
+#### 5. 修复 DOF 索引 bug（B4 修复）
+- **文件**: `cra/envs/shadow_hand_rotation.py`
+- `set_dof_state_tensor_indexed` 需要 DOF index 而非 actor index
+- 新增 `hand_dof_indices = hand_indices * num_hand_dofs`
+- 同时计算 `object_body_indices` 用于外力施加
+
+#### 6. 添加观测归一化（B5 修复）
+- **新文件**: `cra/utils/obs_normalizer.py`
+- `ObsNormalizer(nn.Module)` 实现 Welford 在线均值/方差估计
+- 支持 `clip_range` 截断、`train()`/`eval()` 模式切换
+- 集成到 `cra_trainer.py` 和 `baseline_trainer.py`
+
+#### 7. 正交性损失 — novelty 提升
+- **文件**: `cra/models/cra_policy.py`, `cra/algo/ppo.py`
+- `L_orth = Σ_{i<j} cos_sim(z_i, z_j)²` 鼓励各 stage latent 解耦
+- `PPOConfig` 新增 `orthogonality_coef: float = 0.01`
+- 仅在 `num_stages >= 2` 且 `has_history` 时激活
+
+#### 8. Interaction Head — 解决 additive 假设
+- **文件**: `cra/models/cra_policy.py`
+- `InteractionHead` 小型 MLP: `ψ(z_cat) -> δa`，捕捉跨轴非线性效应
+- 近零初始化 (`init_scale=0.001`) 确保平滑过渡
+- `stage_idx >= 1` 时自动创建
+- `action = base + residual + interaction_head(z_cat)`
+
+### Phase 2: Baseline & 实验基础设施
+
+#### 9. Curriculum DR Baseline（B6 + C3 修复，核心 baseline）
+- **新文件**: `configs/method/curriculum_dr.yaml`
+- **修改**: `cra/models/baselines.py` — 添加 `CurriculumDRPolicy`
+- **修改**: `cra/trainer/baseline_trainer.py` — 添加 `_train_curriculum()` 方法
+- 同 CRA 的 staged DR schedule，但单一网络全部参数不冻结
+- 隔离 CRA 增益来源: 是 curriculum 还是 cascade architecture
+
+#### 10. 参数量对齐 Baseline（A3 修复）
+- **新文件**: `configs/method/full_dr_large.yaml`
+- **新文件**: `configs/method/rma_large.yaml`
+- `actor_hidden_dims: [1024, 512, 256]`，参数量对齐 CRA ~1.1M
+
+#### 11. 环境测试脚本
+- **新文件**: `scripts/test_env_standalone.py`
+- 测试 DR 采样、观测构建、奖励计算、reset 逻辑、per-env gravity
+- 支持 `--render` 、`--num-envs`、`--steps`、`--object-type` 参数
+
+#### 12. Rendering 支持
+- **修改**: `cra/envs/base_env.py` — 非 headless 模式自动创建 viewer
+- `step()` 中自动渲染 + frame sync
+- `close()` 中清理 viewer 资源
+- `scripts/train.py` 添加 `--render` 参数覆盖 `--headless`
+
+#### 13. 组合泛化评估脚本
+- **新文件**: `scripts/eval_compositional.py`
+- 4 种评估协议: 单轴 / 成对 / 全轴 / 外推 (1.5× range)
+- 输出 JSON 结果文件
+
+#### 14. 多种子基准脚本
+- **新文件**: `scripts/benchmark.py`
+- 支持 `--methods`、`--seeds`、`--dry-run`
+- 生成 manifest.json + 顺序执行 + 结果汇总
+
+#### 15. 轴排序消融脚本
+- **新文件**: `scripts/ablation_ordering.py`
+- 自动生成所有 3 轴排列的 config 文件
+- 支持多种子 + dry-run
+
+#### 16. WandB 集成
+- **修改**: `cra/utils/logger.py`
+- `Logger` 新增 `use_wandb`、`wandb_project`、`wandb_entity`、`wandb_config` 参数
+- `log_metrics()` 同时写入 TensorBoard 和 WandB
+- `close()` 自动调用 `wandb.finish()`
+
+#### 17. 非对称 Actor-Critic（Privileged Critic）
+- **修改**: `cra/models/base_policy.py`
+- `ActorCritic` 新增 `privileged_dim` 参数
+- Critic 输入: `[obs, privileged_info]`（训练时可传入真实 DR 参数）
+- Actor 仅使用 `obs`
+- `forward()`、`get_action()`、`evaluate_actions()` 均支持可选 `privileged` 参数
+
+#### 18. eval.py / train.py 更新
+- 支持 `curriculum_dr` 方法
+- 修复 legacy `gravity_dir`/`gravity_mag` → 统一 `gravity`
+- 正确构造 curriculum DR trainer 配置
+
+### Phase 3: 深度反思与关键修复（Critical Reflection & Fixes）
+
+> **本节基于完整代码审查后的第二轮反思，重点关注可能导致实验失败、论文被拒的致命/高危问题。**
+
+#### 19. [致命] 四元数约定不匹配修复
+- **文件**: `cra/envs/rewards.py`
+- **问题**: `rewards.py` 所有四元数函数使用 `(w,x,y,z)` 约定，但 IsaacGym `root_state` tensor 使用 `(x,y,z,w)` 约定。`shadow_hand_rotation.py:310` 直接取 `root_state[:, 3:7]` 传给 reward 函数 → **旋转奖励完全错误**
+- **修复**: 在 `_compute_observations()` 和 `_compute_rewards()` 中对 `object_quat` 执行 `xyzw_to_wxyz` 转换；`target_quat` 已使用 `quat_from_euler_xyz()`（IsaacGym 自带函数，返回 `xyzw`），也需转换
+- 添加 `xyzw_to_wxyz()` 和 `wxyz_to_xyzw()` 辅助函数到 `rewards.py`
+
+#### 20. [致命] Large Baseline 配置接线修复
+- **文件**: `scripts/train.py`, `cra/trainer/baseline_trainer.py`
+- **问题**: `full_dr_large.yaml` 和 `rma_large.yaml` 定义的 `actor_hidden_dims` 从未被 `train.py` 或 `BaselineTrainerConfig` 读取 → "参数量对齐"实验实际使用默认架构，与标准 baseline 完全相同
+- **修复**: `BaselineTrainerConfig` 新增 `actor_hidden_dims` 和 `critic_hidden_dims` 字段；`BaselineTrainer.__init__` 构造 policy 时传入；`train.py` 从 config 读取并传入
+
+#### 21. [高危] 移除 InteractionHead
+- **文件**: `cra/models/cra_policy.py`, `cra/trainer/cra_trainer.py`
+- **问题**: InteractionHead 接受所有 latents 的 concatenation → 直接否定了 additive decomposition 的核心 story。Reviewer 会指出这是自我矛盾：你声称 additive structure 是优势，又加了一个 joint MLP 来弥补
+- **决策**: 完全移除 InteractionHead。如果实验显示 additive 不够，应该诚实讨论为 limitation，而非用一个 hack 来修补。纯 additive 结构是更干净的 contribution
+- 保留 `use_interaction_head` 配置项设为 `False`，代码中移除 InteractionHead 类和相关逻辑
+
+#### 22. [高危] 修复 CRA latent 冗余计算
+- **文件**: `cra/models/cra_policy.py`
+- **问题**: `get_action()` 中 `forward_action_mean()` 计算一次 latents，然后第 335 行又计算一次用于 critic。GRU forward pass 是计算瓶颈，这浪费了 ~50% 的推理时间
+- **修复**: 重构 `forward_action_mean()` 返回 `(action_mean, latents)`；`get_action()` 和 `evaluate_actions()` 复用 latents
+
+#### 23. [高危] 修复 eval 环境 DR 配置
+- **文件**: `cra/trainer/cra_trainer.py`
+- **问题**: `eval_env` 从不 enable DR axes → stage 训练期间的 evaluation 指标无意义（在无 DR 环境上评估适应能力）
+- **修复**: 在每个 stage 开始时，对 `eval_env.dr_manager` 也 enable 相应的 DR axis
+
+#### 24. [高危] 修复 DOF 索引计算
+- **文件**: `cra/envs/shadow_hand_rotation.py`
+- **问题**: `hand_dof_indices = hand_indices * num_hand_dofs` 假设每个 actor 恰好有 `num_hand_dofs` 个 DOF，但 object actor 也有 DOF（free body = 6 DOF）。正确计算应用 `gym.get_actor_dof_index()` 或考虑 object DOF
+- **修复**: 使用 `gym.find_actor_dof_handle()` 正确获取 DOF 起始索引
+
+#### 25. [中危] 修复正交性损失投影
+- **文件**: `cra/models/cra_policy.py`
+- **问题**: 当 latent dims 不同时，截取前 `min_d` 维做 cosine similarity 是不正确的——忽略了剩余维度的信息
+- **修复**: 使用可学习的线性投影到公共维度，或统一所有 stage 使用相同 latent dim（推荐后者，更简洁）
+
+#### 26. [中危] 修复 KL early stopping 逻辑
+- **文件**: `cra/algo/ppo.py`
+- **问题**: `avg_kl = total_approx_kl / max(num_updates, 1)` 是所有 epoch+batch 的累积平均 → 即使当前 epoch KL 很高，被之前低 KL 稀释后不会触发 early stop
+- **修复**: 每个 epoch 结束时检查该 epoch 的平均 KL
+
+#### 27. [中危] 接线 reach_goal_bonus 配置
+- **文件**: `cra/envs/rewards.py`, `cra/envs/shadow_hand_rotation.py`
+- **问题**: `RotationEnvConfig.reach_goal_bonus = 250.0` 从未使用。`rotation_reward()` 中 success bonus 硬编码为 2.0
+- **修复**: `rotation_reward()` 接受 `success_bonus` 参数；`_compute_rewards()` 传入 `self.task_cfg.reach_goal_bonus`
+
+#### 28. [中危] RMA config 使用 legacy gravity 轴
+- **文件**: `configs/method/rma.yaml`
+- **问题**: 使用 `gravity_dir` + `gravity_mag` 而非统一的 `gravity` → 与 CRA/FullDR 使用不同的 gravity sampling 行为，造成不公平比较
+- **修复**: 改为统一的 `gravity` 轴
+
+### Idea 层面的关键改进
+
+#### I1. 组合泛化声明的修正
+- **原声明**: "每个 adapter 独立响应 → 天然支持组合外推"
+- **问题**: 信息层面不独立（obs history 包含所有轴的综合效应）
+- **修正后声明**: "CRA 的组合泛化来源于**条件残差补偿结构**：每个 stage 被训练为在前级冻结的条件下补偿**一个新轴**的影响。由于冻结使得每个 stage 的训练是一个稳态 MDP，每个 adapter 学到的是**条件增量函数**而非联合辨识。在弱耦合假设下，这种 additive conditional residual 结构对 unseen 组合的泛化误差低于联合训练的 bound。"
+
+#### I2. 移除 InteractionHead，保持方法纯净性
+- 纯 additive 结构是更强的 contribution（简洁、可解释、可并行）
+- 如果 additive 不够用，这是一个**诚实的 limitation**，不应该用 hack 掩盖
+
+#### I3. 关于 novelty 的强化
+- 核心 novelty 是三个设计的**结合**：(1) 参数轴分解 (2) 冻结级联 (3) additive 残差
+- 需要消融实验证明每个组件的独立贡献：CRA-NoFreeze（无冻结）、CRA-SingleAxis（单一大 adapter）、CurriculumDR（同 schedule 但单网络）
+
+### 待完成项
+
+- [ ] Grasp Transition 环境 (`shadow_hand_grasp_transition.py`)
+- [ ] 跨任务迁移实验脚本 (`scripts/eval_cross_task.py`)
+- [ ] Object geometry axis (`object_scale`, YCB 多物体)
+- [ ] Demo 采集脚本 (`scripts/collect_demos.py`)
+- [ ] 结果可视化脚本 (`scripts/plot_results.py`)
+- [ ] CRA-Small 配置（参数量对齐 FullDR ~0.5M）
+- [ ] CRA-NoFreeze 消融配置
+- [ ] End-to-end 训练烟雾测试 + 形状验证
